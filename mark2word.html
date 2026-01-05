@@ -621,11 +621,9 @@
                     // 表头单元格（支持内联公式）：异步构建
                     const headerCells = [];
                     for (const h of token.header) {
-                        const runs = h.tokens
-                            ? await parseInlineText(h, { bold: true, italics: false, color: undefined }, mathCache, options)
-                            : await parseInlineTextFromString(h.text || "", { bold: true, italics: false, color: undefined }, mathCache, options);
+                        const paragraphs = await parseCellContent(h, { bold: true, italics: false, color: undefined }, mathCache, options, "center");
                         headerCells.push(new docx.TableCell({
-                            children: [new docx.Paragraph({ children: runs, alignment: "center" })],
+                            children: paragraphs,
                             shading: { fill: "f3f4f6" },
                         }));
                     }
@@ -633,11 +631,9 @@
                     for (const row of token.rows) {
                         const cells = [];
                         for (const cell of row) {
-                            const runs = cell.tokens
-                                ? await parseInlineText(cell, { bold: false, italics: false, color: undefined }, mathCache, options)
-                                : await parseInlineTextFromString(cell.text || "", { bold: false, italics: false, color: undefined }, mathCache, options);
+                            const paragraphs = await parseCellContent(cell, { bold: false, italics: false, color: undefined }, mathCache, options, "center");
                             cells.push(new docx.TableCell({
-                                children: [new docx.Paragraph({ children: runs, alignment: "center" })]
+                                children: paragraphs
                             }));
                         }
                         tableRows.push(new docx.TableRow({ children: cells }));
@@ -669,6 +665,64 @@
                 case 5: return docx.HeadingLevel.HEADING_5;
                 default: return docx.HeadingLevel.HEADING_6;
             }
+        }
+
+        // 解析表格单元格内容，支持 <br> 换行（每行创建一个段落）
+        async function parseCellContent(cellToken, style, mathCache, options, alignment = "left") {
+            // 获取单元格的文本内容
+            let cellText = cellToken.text || "";
+            
+            // 按 <br> 或 <br/> 或 <br /> 分割成多行
+            const lines = cellText.split(/<br\s*\/?>/i);
+            
+            const paragraphs = [];
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                
+                // 跳过空行（但保留一个空段落以保持换行效果）
+                if (!trimmedLine) {
+                    paragraphs.push(new docx.Paragraph({ 
+                        children: [new docx.TextRun({ text: "" })],
+                        alignment: alignment,
+                        spacing: { after: 0, before: 0 }
+                    }));
+                    continue;
+                }
+                
+                // 为每一行创建临时 token 来解析其内联样式
+                const lineToken = {
+                    type: 'text',
+                    text: trimmedLine,
+                    tokens: null
+                };
+                
+                // 尝试用 marked 解析这一行的内联样式（加粗、斜体等）
+                try {
+                    const inlineTokens = marked.lexer(trimmedLine);
+                    if (inlineTokens && inlineTokens.length > 0 && inlineTokens[0].tokens) {
+                        lineToken.tokens = inlineTokens[0].tokens;
+                    }
+                } catch (e) {
+                    // 解析失败，使用原文本
+                    console.warn('单元格行解析失败:', e);
+                }
+                
+                const runs = lineToken.tokens
+                    ? await parseInlineText(lineToken, style, mathCache, options)
+                    : await parseInlineTextFromString(trimmedLine, style, mathCache, options);
+                
+                paragraphs.push(new docx.Paragraph({ 
+                    children: runs, 
+                    alignment: alignment,
+                    spacing: { after: 100, before: 0 }
+                }));
+            }
+            
+            // 如果没有段落，返回一个空段落
+            return paragraphs.length > 0 ? paragraphs : [new docx.Paragraph({ 
+                children: [new docx.TextRun({ text: "" })],
+                alignment: alignment
+            })];
         }
 
         async function parseInlineText(token, style = { bold: false, italics: false, color: undefined }, mathCache = null, options = { mathMode: 'omml', mathPlaceholders: [] }) {
