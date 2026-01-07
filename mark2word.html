@@ -411,6 +411,16 @@
             const src = String(markdown || '').replace(/\r\n/g, '\n');
             const lines = src.split('\n');
 
+            const countTableCols = (line) => {
+                const s = String(line || '').trim();
+                if (!s.includes('|')) return 0;
+                let parts = s.split('|');
+                // 去掉因首尾竖线导致的空单元格
+                if (parts.length && parts[0].trim() === '') parts = parts.slice(1);
+                if (parts.length && parts[parts.length - 1].trim() === '') parts = parts.slice(0, -1);
+                return parts.length;
+            };
+
             const isTableSep = (line) => {
                 // 允许：| --- | --- | / |:---|---:| 等
                 const s = String(line || '').trim();
@@ -421,7 +431,12 @@
                 return s.startsWith('|') && s.includes('|');
             };
             const isRowStart = (line) => String(line || '').trim().startsWith('|');
-            const isRowComplete = (row) => String(row || '').trimEnd().endsWith('|');
+            // 行是否“完整”：不强依赖末尾必须有 '|'（Markdown 允许省略末尾竖线）
+            // 用“列数达到表头列数”作为判定，更稳，避免导出时列数不齐导致 Word 里列整体左移（看起来像列错乱）
+            const isRowCompleteByCols = (row, expectedCols) => {
+                const cols = countTableCols(row);
+                return expectedCols > 0 ? (cols >= expectedCols) : String(row || '').trimEnd().endsWith('|');
+            };
 
             const out = [];
             let i = 0;
@@ -430,6 +445,7 @@
 
                 // 识别表格：header + 分隔线
                 if (isTableHeader(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+                    const expectedCols = countTableCols(line);
                     out.push(line.trimEnd());
                     out.push(lines[i + 1].trimEnd());
                     i += 2;
@@ -451,7 +467,7 @@
                                 rowBuf = null;
                             }
                             rowBuf = cur.trimEnd();
-                            if (isRowComplete(rowBuf)) {
+                            if (isRowCompleteByCols(rowBuf, expectedCols)) {
                                 out.push(rowBuf.trimEnd());
                                 rowBuf = null;
                             }
@@ -467,7 +483,7 @@
                             } else {
                                 rowBuf += trimmed;
                             }
-                            if (isRowComplete(rowBuf)) {
+                            if (isRowCompleteByCols(rowBuf, expectedCols)) {
                                 out.push(rowBuf.trimEnd());
                                 rowBuf = null;
                             }
@@ -721,9 +737,11 @@
                 }
                 else if (token.type === 'table') {
                     const tableRows = [];
+                    const colCount = Array.isArray(token.header) ? token.header.length : 0;
                     // 表头单元格（支持内联公式）：异步构建
                     const headerCells = [];
-                    for (const h of token.header) {
+                    for (let ci = 0; ci < colCount; ci++) {
+                        const h = token.header[ci] ?? "";
                         const paragraphs = await parseCellContent(h, { bold: true, italics: false, color: undefined }, mathCache, options, "center");
                         headerCells.push(new docx.TableCell({
                             children: paragraphs,
@@ -732,12 +750,26 @@
                     }
                     tableRows.push(new docx.TableRow({ children: headerCells }));
                     for (const row of token.rows) {
+                        // 关键修复：确保每一行的 cell 数量与表头一致
+                        // 否则 Word 会把缺失列之后的所有列整体左移，看起来就是“列错乱”
+                        const rawCells = Array.isArray(row) ? row.slice() : [];
+                        if (colCount > 0) {
+                            if (rawCells.length < colCount) {
+                                while (rawCells.length < colCount) rawCells.push("");
+                            } else if (rawCells.length > colCount) {
+                                // 若解析出多余列：合并到最后一列，避免列数溢出
+                                const head = rawCells.slice(0, colCount - 1);
+                                const tail = rawCells.slice(colCount - 1);
+                                rawCells.length = 0;
+                                rawCells.push(...head, tail.map(x => (typeof x === "string" ? x : (x && typeof x.text === "string" ? x.text : String(x)))).join(" | "));
+                            }
+                        }
+
                         const cells = [];
-                        for (const cell of row) {
+                        for (let ci = 0; ci < (colCount || rawCells.length); ci++) {
+                            const cell = rawCells[ci] ?? "";
                             const paragraphs = await parseCellContent(cell, { bold: false, italics: false, color: undefined }, mathCache, options, "center");
-                            cells.push(new docx.TableCell({
-                                children: paragraphs
-                            }));
+                            cells.push(new docx.TableCell({ children: paragraphs }));
                         }
                         tableRows.push(new docx.TableRow({ children: cells }));
                     }
@@ -773,8 +805,17 @@
         // 解析表格单元格内容：支持 <br> / <br/> / <br />，以及被 normalize 后拼接在同一行的内容
         // 每个换行生成一个段落（空行生成空段落）
         async function parseCellContent(cellToken, style, mathCache, options, alignment = "left") {
-            // 获取单元格的文本内容
-            let cellText = cellToken.text || "";
+            // 获取单元格的文本内容（marked 的 table cell 在不同版本里可能是 string 或 { text, tokens }）
+            let cellText = "";
+            if (cellToken == null) {
+                cellText = "";
+            } else if (typeof cellToken === "string") {
+                cellText = cellToken;
+            } else if (typeof cellToken === "object" && typeof cellToken.text === "string") {
+                cellText = cellToken.text;
+            } else {
+                cellText = String(cellToken);
+            }
             
             // 统一把 <br> 转成 '\n'，便于按行拆段落
             const normalized = String(cellText || '')
