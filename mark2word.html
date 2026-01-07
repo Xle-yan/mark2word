@@ -352,6 +352,104 @@
             setTimeout(() => t.classList.remove('show'), 2000);
         }
 
+        // 清理不可见的零宽字符（常见于从某些编辑器/IM 粘贴），否则会导致 **...** 配对失败/错配
+        // 例如：看起来是 "**"，实际是 "*\u200b*"，会出现“中间被加粗，两端 ** 当文本输出”的现象
+        function stripZeroWidthChars(text) {
+            return String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+        }
+
+        // 预览专用：在进入 marked 之前，对“宽松 **...** 加粗”做一次文本级预处理
+        // 目的：避免 marked 在某些中文标点场景下把 ** 拆成跨节点残留，进而被 DOM 兜底逻辑误包裹（出现中间普通文字也被加粗）
+        // 规则：
+        // - 仅在非代码块/非行内代码范围内处理
+        // - 仅当本行 ** 数量为偶数时才替换（避免误配）
+        // - 不跨行配对
+        function preprocessLooseBoldForPreview(markdown) {
+            const src = stripZeroWidthChars(String(markdown || '').replace(/\r\n/g, '\n'));
+            const lines = src.split('\n');
+            let inFence = false;
+            let fenceTickCount = 0;
+
+            const processLine = (line) => {
+                // 统计本行（排除行内代码）中的 ** 数量
+                let inCode = false;
+                let codeDelim = '';
+                let count = 0;
+                for (let i = 0; i < line.length; i++) {
+                    const ch = line[i];
+                    if (ch === '`') {
+                        // 取连续反引号作为 delimiter
+                        let j = i;
+                        while (j < line.length && line[j] === '`') j++;
+                        const delim = line.slice(i, j);
+                        if (!inCode) {
+                            inCode = true; codeDelim = delim;
+                        } else if (delim === codeDelim) {
+                            inCode = false; codeDelim = '';
+                        }
+                        i = j - 1;
+                        continue;
+                    }
+                    if (!inCode && ch === '*' && line[i + 1] === '*') {
+                        count++;
+                        i++;
+                    }
+                }
+                if (count < 2 || (count % 2) === 1) return line;
+
+                // 替换：遇到 ** 就 toggle <strong>
+                inCode = false;
+                codeDelim = '';
+                let bold = false;
+                let out = '';
+                for (let i = 0; i < line.length; i++) {
+                    const ch = line[i];
+                    if (ch === '`') {
+                        let j = i;
+                        while (j < line.length && line[j] === '`') j++;
+                        const delim = line.slice(i, j);
+                        if (!inCode) {
+                            inCode = true; codeDelim = delim;
+                        } else if (delim === codeDelim) {
+                            inCode = false; codeDelim = '';
+                        }
+                        out += delim;
+                        i = j - 1;
+                        continue;
+                    }
+                    if (!inCode && ch === '*' && line[i + 1] === '*') {
+                        out += (bold ? '</strong>' : '<strong>');
+                        bold = !bold;
+                        i++;
+                        continue;
+                    }
+                    out += ch;
+                }
+                // 保守兜底：如果出现未闭合，回退原行
+                if (bold) return line;
+                return out;
+            };
+
+            const out = [];
+            for (const line of lines) {
+                const trimmed = line.trimStart();
+                if (trimmed.startsWith('```')) {
+                    // 进入/退出代码块（按连续 ``` 的数量粗略匹配）
+                    const m = trimmed.match(/^(`{3,})/);
+                    const ticks = m ? m[1].length : 3;
+                    if (!inFence) {
+                        inFence = true; fenceTickCount = ticks;
+                    } else if (ticks >= fenceTickCount) {
+                        inFence = false; fenceTickCount = 0;
+                    }
+                    out.push(line);
+                    continue;
+                }
+                out.push(inFence ? line : processLine(line));
+            }
+            return out.join('\n');
+        }
+
         docxInput.addEventListener('change', async (e) => {
             const file = e.target.files && e.target.files[0];
             if (!file) return;
@@ -372,14 +470,16 @@
         }
 
         function convertMdToPreview() {
-            const mdRaw = mdInput.value;
+            // 预览：先做“宽松加粗”文本预处理，避免 DOM 兜底误加粗
+            const mdRaw = preprocessLooseBoldForPreview(mdInput.value);
             // 修复：表格单元格内存在“真实空行”会导致 marked 认为表格结束，从而表格后半段跑出表格
             // 这里先把表格块里被换行拆断的行拼回单行（保留 <br>），保证 marked 正确产出 table token
             const md = normalizeMarkdownTables(mdRaw);
             wordPage.innerHTML = marked.parse(md);
-            // 兼容中文场景下 marked 未识别的 **...**：在预览 DOM 中做一次宽松加粗兜底
-            // 例如：做**“时间-温度-转化率”的平衡游戏**。
-            wrapLooseBoldInDom(wordPage);
+            // 如果预览 HTML 里仍残留 **（极少数情况），再做一次 DOM 兜底；否则不做，避免误包裹
+            if (wordPage.innerHTML.includes('**')) {
+                wrapLooseBoldInDom(wordPage);
+            }
             // 把文本节点里的 $...$ / $$...$$ 包起来，并用 MathJax 渲染（避免破坏 turndown 的可逆性）
             wrapMathInDom(wordPage);
             renderMathInPreview(wordPage);
@@ -515,7 +615,7 @@
         const INDENT_PER_LEVEL = 720;
 
         async function downloadDocx() {
-            let text = mdInput.value;
+            let text = stripZeroWidthChars(mdInput.value);
             if (!text.trim()) return;
             
             // 修复：先把表格块里被换行拆断的行拼回单行，保证 marked 正确识别 table
@@ -1557,39 +1657,104 @@
         // 用于中文标点/引号紧贴时 marked 可能不识别 strong 的场景；跳过 code/pre/script/style 等区域
         function wrapLooseBoldInDom(root) {
             if (!root) return;
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-                acceptNode: (node) => {
-                    if (!node || !node.nodeValue || node.nodeValue.indexOf('**') === -1) return NodeFilter.FILTER_REJECT;
-                    const p = node.parentNode;
-                    if (!p) return NodeFilter.FILTER_REJECT;
-                    const tag = (p.nodeName || '').toUpperCase();
-                    // 这些区域不做替换，避免破坏代码/脚本/样式/已加粗节点
-                    if (tag === 'CODE' || tag === 'PRE' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'STRONG') return NodeFilter.FILTER_REJECT;
-                    return NodeFilter.FILTER_ACCEPT;
+            const EXCLUDED_TAGS = new Set(['CODE', 'PRE', 'SCRIPT', 'STYLE']);
+
+            const countOccurrences = (haystack, needle) => {
+                const s = String(haystack || '');
+                const n = String(needle || '');
+                if (!n) return 0;
+                let count = 0;
+                let idx = 0;
+                while (true) {
+                    const at = s.indexOf(n, idx);
+                    if (at === -1) break;
+                    count++;
+                    idx = at + n.length;
                 }
-            });
+                return count;
+            };
 
-            const textNodes = [];
-            let cur;
-            while ((cur = walker.nextNode())) textNodes.push(cur);
+            // 仅在“同一父元素的直接子节点”层面做跨节点配对，避免破坏更深层结构（如链接/代码等）
+            function fixLooseBoldInDirectChildren(container) {
+                if (!container || !container.childNodes || container.childNodes.length === 0) return;
+                const tag = (container.nodeName || '').toUpperCase();
+                if (EXCLUDED_TAGS.has(tag) || tag === 'STRONG') return;
 
-            for (const node of textNodes) {
-                const segments = splitTextAndLooseBold(node.nodeValue || "");
-                if (!segments.some(s => s.type === 'bold')) continue;
+                const children = Array.from(container.childNodes);
+                // 只统计“直接 text 节点”中的 ** 数量；嵌套元素里的 ** 由递归到子元素时处理
+                let markerCount = 0;
+                for (const ch of children) {
+                    if (ch.nodeType === 3) markerCount += countOccurrences(ch.nodeValue, '**');
+                }
+                if (markerCount < 2 || markerCount % 2 === 1) return;
 
+                let bold = false;
+                let currentStrong = null;
                 const frag = document.createDocumentFragment();
-                for (const seg of segments) {
-                    if (!seg.value) continue;
-                    if (seg.type === 'text') {
-                        frag.appendChild(document.createTextNode(seg.value));
+
+                const ensureStrong = () => {
+                    if (!currentStrong) {
+                        currentStrong = document.createElement('strong');
+                        frag.appendChild(currentStrong);
+                    }
+                };
+                const appendNode = (node) => {
+                    if (!node) return;
+                    if (bold) {
+                        ensureStrong();
+                        currentStrong.appendChild(node);
                     } else {
-                        const el = document.createElement('strong');
-                        el.textContent = seg.value;
-                        frag.appendChild(el);
+                        // 关闭当前 strong（避免后续继续复用）
+                        currentStrong = null;
+                        frag.appendChild(node);
+                    }
+                };
+
+                for (const ch of children) {
+                    if (ch.nodeType === 3) {
+                        const text = ch.nodeValue || '';
+                        if (!text.includes('**')) {
+                            appendNode(document.createTextNode(text));
+                            continue;
+                        }
+                        let i = 0;
+                        while (i < text.length) {
+                            const open = text.indexOf('**', i);
+                            if (open === -1) {
+                                const tail = text.slice(i);
+                                if (tail) appendNode(document.createTextNode(tail));
+                                break;
+                            }
+                            const before = text.slice(i, open);
+                            if (before) appendNode(document.createTextNode(before));
+                            // toggle
+                            bold = !bold;
+                            if (!bold) currentStrong = null;
+                            i = open + 2;
+                        }
+                        continue;
+                    }
+
+                    // 元素节点：保持原节点，但根据当前 bold 状态决定是否包裹进 strong
+                    // 注意：不处理 ch 内部（递归会在外层遍历中处理其子元素）
+                    const chTag = (ch.nodeName || '').toUpperCase();
+                    const moved = ch; // 直接移动节点，避免 clone 丢事件（预览区一般也无事件）
+                    if (EXCLUDED_TAGS.has(chTag) || chTag === 'STRONG') {
+                        // 排除节点：不改变其内部结构；但如果当前处于 bold 状态，仍允许被包裹（多数场景无影响）
+                        appendNode(moved);
+                    } else {
+                        appendNode(moved);
                     }
                 }
-                node.parentNode.replaceChild(frag, node);
+
+                // 替换 DOM
+                container.textContent = '';
+                container.appendChild(frag);
             }
+
+            // 遍历所有元素（含 root 本身），逐层处理，确保 ** 分散在多个 text node 时也能正确配对
+            const elements = [root, ...Array.from(root.querySelectorAll('*'))];
+            for (const el of elements) fixLooseBoldInDirectChildren(el);
         }
 
         function splitTextAndLooseBold(text) {
