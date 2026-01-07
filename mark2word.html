@@ -450,6 +450,86 @@
             return out.join('\n');
         }
 
+        // 导出 Word 专用：把 **...** 预处理成“显式开/关”标记，避免 marked 的强调解析偶发错配导致导出的加粗范围不正确
+        // - 使用私有区字符作为标记（不会在 Word 中显示）
+        // - 不处理代码块/行内代码
+        // - 不跨行配对；单行 ** 数量为偶数才替换
+        const DOCX_BOLD_OPEN = '\uE000';
+        const DOCX_BOLD_CLOSE = '\uE001';
+        function preprocessLooseBoldForDocx(markdown) {
+            const src = stripZeroWidthChars(String(markdown || '').replace(/\r\n/g, '\n'));
+            const lines = src.split('\n');
+            let inFence = false;
+            let fenceTickCount = 0;
+
+            const countBoldMarkersInLine = (line) => {
+                let inCode = false;
+                let codeDelim = '';
+                let count = 0;
+                for (let i = 0; i < line.length; i++) {
+                    const ch = line[i];
+                    if (ch === '`') {
+                        let j = i;
+                        while (j < line.length && line[j] === '`') j++;
+                        const delim = line.slice(i, j);
+                        if (!inCode) { inCode = true; codeDelim = delim; }
+                        else if (delim === codeDelim) { inCode = false; codeDelim = ''; }
+                        i = j - 1;
+                        continue;
+                    }
+                    if (!inCode && ch === '*' && line[i + 1] === '*') { count++; i++; }
+                }
+                return count;
+            };
+
+            const processLine = (line) => {
+                const count = countBoldMarkersInLine(line);
+                if (count < 2 || (count % 2) === 1) return line;
+
+                let inCode = false;
+                let codeDelim = '';
+                let bold = false;
+                let out = '';
+                for (let i = 0; i < line.length; i++) {
+                    const ch = line[i];
+                    if (ch === '`') {
+                        let j = i;
+                        while (j < line.length && line[j] === '`') j++;
+                        const delim = line.slice(i, j);
+                        if (!inCode) { inCode = true; codeDelim = delim; }
+                        else if (delim === codeDelim) { inCode = false; codeDelim = ''; }
+                        out += delim;
+                        i = j - 1;
+                        continue;
+                    }
+                    if (!inCode && ch === '*' && line[i + 1] === '*') {
+                        out += (bold ? DOCX_BOLD_CLOSE : DOCX_BOLD_OPEN);
+                        bold = !bold;
+                        i++;
+                        continue;
+                    }
+                    out += ch;
+                }
+                if (bold) return line; // 未闭合则回退
+                return out;
+            };
+
+            const out = [];
+            for (const line of lines) {
+                const trimmed = line.trimStart();
+                if (trimmed.startsWith('```')) {
+                    const m = trimmed.match(/^(`{3,})/);
+                    const ticks = m ? m[1].length : 3;
+                    if (!inFence) { inFence = true; fenceTickCount = ticks; }
+                    else if (ticks >= fenceTickCount) { inFence = false; fenceTickCount = 0; }
+                    out.push(line);
+                    continue;
+                }
+                out.push(inFence ? line : processLine(line));
+            }
+            return out.join('\n');
+        }
+
         docxInput.addEventListener('change', async (e) => {
             const file = e.target.files && e.target.files[0];
             if (!file) return;
@@ -615,7 +695,8 @@
         const INDENT_PER_LEVEL = 720;
 
         async function downloadDocx() {
-            let text = stripZeroWidthChars(mdInput.value);
+            // 导出侧：先把 **...** 转为显式标记，避免 marked 强调解析错配导致 Word 加粗范围错误
+            let text = preprocessLooseBoldForDocx(mdInput.value);
             if (!text.trim()) return;
             
             // 修复：先把表格块里被换行拆断的行拼回单行，保证 marked 正确识别 table
@@ -1052,8 +1133,38 @@
         // 只做最小兜底：不处理嵌套，不跨段落；找不到成对 ** 则保留原样。
         function buildRunsFromLooseBold(text, style) {
             const s = String(text || "");
-            if (!s.includes('**')) {
-                return s ? [new docx.TextRun({ text: s, ...style })] : [];
+            const hasDocxMarkers = s.includes(DOCX_BOLD_OPEN) || s.includes(DOCX_BOLD_CLOSE);
+            const hasAsterisks = s.includes('**');
+            if (!hasDocxMarkers && !hasAsterisks) return s ? [new docx.TextRun({ text: s, ...style })] : [];
+
+            const stripMarkers = (v) => String(v || '').replace(new RegExp(DOCX_BOLD_OPEN, 'g'), '').replace(new RegExp(DOCX_BOLD_CLOSE, 'g'), '');
+
+            // 优先处理显式开/关标记（导出侧预处理生成，最可靠）
+            if (hasDocxMarkers) {
+                const out = [];
+                let i = 0;
+                while (i < s.length) {
+                    const open = s.indexOf(DOCX_BOLD_OPEN, i);
+                    if (open === -1) {
+                        const tail = stripMarkers(s.slice(i));
+                        if (tail) out.push(new docx.TextRun({ text: tail, ...style }));
+                        break;
+                    }
+                    const before = stripMarkers(s.slice(i, open));
+                    if (before) out.push(new docx.TextRun({ text: before, ...style }));
+
+                    const close = s.indexOf(DOCX_BOLD_CLOSE, open + 1);
+                    if (close === -1) {
+                        // 未闭合：把剩余当普通文本（移除标记）
+                        const rest = stripMarkers(s.slice(open + 1));
+                        if (rest) out.push(new docx.TextRun({ text: rest, ...style }));
+                        break;
+                    }
+                    const boldText = stripMarkers(s.slice(open + 1, close));
+                    if (boldText) out.push(new docx.TextRun({ text: boldText, ...style, bold: true }));
+                    i = close + 1;
+                }
+                return out;
             }
 
             const out = [];
